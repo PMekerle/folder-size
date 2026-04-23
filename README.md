@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="FolderSize/Assets/icon.png" width="140" alt="Folder Size logo" />
+  <img src="logo.png" width="160" alt="Folder Size logo" />
 </p>
 
 <h1 align="center">Folder Size</h1>

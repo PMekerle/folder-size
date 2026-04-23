@@ -27,9 +27,9 @@ Most disk analyzers either look like they were designed in 2005 or hide simple t
 
 ## Download
 
-Pre-built single-file portable executable (no .NET install needed):
+[**Download FolderSize.exe**](https://github.com/PMekerle/folder-size/raw/main/FolderSize.exe) — single-file portable, ~77 MB, no install, no .NET required. Just run it.
 
-> Coming via GitHub Releases. For now, build it yourself — it's one command (see below).
+Or [view in repo](FolderSize.exe).
 
 ## Build
 

@@ -66,6 +66,7 @@ public partial class MainWindow
     private void Back_Click(object sender, RoutedEventArgs e) => _vm.GoBack();
     private void Forward_Click(object sender, RoutedEventArgs e) => _vm.GoForward();
     private void Up_Click(object sender, RoutedEventArgs e) => _vm.GoUp();
+    private void Home_Click(object sender, RoutedEventArgs e) => _vm.GoHome();
 
     private void Cancel_Click(object sender, RoutedEventArgs e)
     {
@@ -112,6 +113,86 @@ public partial class MainWindow
             try { Process.Start("explorer.exe", $"/select,\"{row.Node.FullPath}\""); }
             catch (Exception ex) { Log.Error($"Show in Explorer failed for {row.Node.FullPath}", ex); }
         }
+    }
+
+    private void BarRowCopyPath_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { DataContext: BarRowViewModel row })
+        {
+            CopyPathToClipboard(row.Node.FullPath);
+        }
+    }
+
+    private void CtxCopyPath_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem mi && mi.DataContext is ExplorerNode node)
+        {
+            CopyPathToClipboard(node.FullPath);
+        }
+    }
+
+    private static void CopyPathToClipboard(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+        try { Clipboard.SetText(path); }
+        catch (Exception ex) { Log.Warn($"Clipboard.SetText failed: {ex.Message}"); }
+    }
+
+    // Right-pane background context menu — operates on the currently-selected folder.
+    private string? CurrentPanePath() => _vm.SelectedNode?.FullPath;
+
+    private void PaneOpenInExplorer_Click(object sender, RoutedEventArgs e)
+    {
+        var path = CurrentPanePath();
+        if (string.IsNullOrWhiteSpace(path)) return;
+        try { Process.Start("explorer.exe", $"\"{path}\""); }
+        catch (Exception ex) { Log.Error($"Open in Explorer failed for {path}", ex); }
+    }
+
+    private void PaneCopyPath_Click(object sender, RoutedEventArgs e)
+        => CopyPathToClipboard(CurrentPanePath());
+
+    private void PaneProperties_Click(object sender, RoutedEventArgs e)
+        => ShowShellProperties(CurrentPanePath() ?? "");
+
+    private async void PaneRescan_Click(object sender, RoutedEventArgs e)
+        => await _vm.RescanSelectedAsync();
+
+    // Drive cards on the home (empty-state) view.
+    private async void DriveCard_Click(object sender, MouseButtonEventArgs e)
+    {
+        // Navigate to the drive without scanning. If it's already in the DB, the
+        // cached scan loads; otherwise the right pane shows the "Scan now" prompt.
+        if (sender is FrameworkElement fe && fe.Tag is string path)
+            await _vm.StartScanAsync(path, autoScan: false);
+    }
+
+    private async void DriveCardScan_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { DataContext: ViewModels.DriveOverview d })
+            await _vm.StartScanAsync(d.Path, forceRescan: true);
+    }
+
+    private void DriveCardOpenExplorer_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { DataContext: ViewModels.DriveOverview d })
+        {
+            try { Process.Start("explorer.exe", $"\"{d.Path}\""); }
+            catch (Exception ex) { Log.Error($"Open in Explorer failed for {d.Path}", ex); }
+        }
+    }
+
+    private void DriveCardCopyPath_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { DataContext: ViewModels.DriveOverview d })
+            CopyPathToClipboard(d.Path);
+    }
+
+    // "Scan now" button inside an unscanned drive tile.
+    private async void DriveCardScanInline_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string path)
+            await _vm.StartScanAsync(path, forceRescan: true);
     }
 
     private void BarRowExpand_Click(object sender, RoutedEventArgs e)

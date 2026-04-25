@@ -19,8 +19,9 @@ public sealed class MainViewModel : ObservableObject
     private readonly IScanner _scanner = new Win32Scanner();
     private readonly ScanDatabase _db = new();
     private readonly AppSettings _settings = AppSettings.Load();
-    private readonly Stack<ExplorerNode> _backStack = new();
-    private readonly Stack<ExplorerNode> _forwardStack = new();
+    // Nullable entries: null sentinel = "home" (This PC view).
+    private readonly Stack<ExplorerNode?> _backStack = new();
+    private readonly Stack<ExplorerNode?> _forwardStack = new();
     private bool _navigating;
 
     // Multi-scan coordination: one active job per drive + a FIFO queue per drive.
@@ -53,8 +54,26 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public bool IsBusy => IsScanning || _isLoading;
-    public bool ShowEmptyHint => !HasBarRows && !_isLoading && !IsScanning && (_selectedNode?.HasScanData != true);
+    // Home (This PC) view: only when nothing is selected.
+    public bool ShowEmptyHint => _selectedNode == null && !_isLoading;
     public bool ShowEmptyFolderHint => !HasBarRows && !_isLoading && !IsScanning && _selectedNode?.HasScanData == true;
+    // "Scanning..." overlay: a node is selected, no data yet, and a scan is in flight on it.
+    public bool ShowSelectedScanningHint => _selectedNode != null
+        && _selectedNode.ScanData == null
+        && !_isLoading
+        && IsSelectedScanning;
+    public string SelectedScanningText => _selectedNode != null ? $"Scanning {_selectedNode.FullPath}…" : "";
+    // "Not scanned yet" hint: a folder is selected, has no data, isn't being scanned right now,
+    // and isn't loading from DB. Show a Scan now button instead of leaving the pane blank.
+    public bool ShowUnscannedHint => _selectedNode != null
+        && _selectedNode.IsFolder
+        && !_selectedNode.IsReparse
+        && _selectedNode.ScanData == null
+        && !_isLoading
+        && !IsSelectedScanning;
+    public string UnscannedHintText => _selectedNode != null
+        ? $"{_selectedNode.FullPath} hasn't been scanned yet."
+        : "";
     public string EmptyFolderText
     {
         get
@@ -76,6 +95,27 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public bool HasLastUpdate => _selectedNode?.ScanTimestamp != null;
+
+    public string SelectedTotalsText
+    {
+        get
+        {
+            var scan = _selectedNode?.ScanData;
+            if (scan == null) return "";
+            bool showOnDisk = true;
+            if (_settings.HideCloseSizeOnDisk && scan.Size > 0)
+            {
+                double diff = System.Math.Abs(scan.SizeOnDisk - scan.Size) / (double)scan.Size;
+                if (diff < 0.01) showOnDisk = false;
+            }
+            string filesPart = scan.FileCount == 1 ? "1 file" : $"{scan.FileCount:N0} files";
+            return showOnDisk
+                ? $"{FormatBytes(scan.Size)} ({FormatBytes(scan.SizeOnDisk)} on disk) • {filesPart}"
+                : $"{FormatBytes(scan.Size)} • {filesPart}";
+        }
+    }
+
+    public bool HasSelectedTotals => _selectedNode?.ScanData != null;
 
     public bool IsSelectedScanning
     {
@@ -144,6 +184,7 @@ public sealed class MainViewModel : ObservableObject
                 _settings.Save();
                 OnPropertyChanged();
                 RefreshBarRows();
+                OnPropertyChanged(nameof(SelectedTotalsText));
             }
         }
     }
@@ -227,11 +268,13 @@ public sealed class MainViewModel : ObservableObject
     public bool ShowActiveScansPanel => ActiveScans.Count > 0;
 
     public ObservableCollection<ExplorerNode> ExplorerRoots { get; } = new();
+    public ObservableCollection<DriveOverview> DriveOverviews { get; } = new();
     public ObservableCollection<BarRowViewModel> BarRows { get; } = new();
     public bool HasBarRows => BarRows.Count > 0;
     public bool CanGoBack => _backStack.Count > 0;
     public bool CanGoForward => _forwardStack.Count > 0;
-    public bool CanGoUp => GetParentPath(_selectedNode) != null;
+    // Even at a drive root we allow Up: it returns to the "This PC" home screen.
+    public bool CanGoUp => _selectedNode != null;
 
     public ExplorerNode? SelectedNode
     {
@@ -247,9 +290,16 @@ public sealed class MainViewModel : ObservableObject
                 OnPropertyChanged(nameof(EmptyFolderText));
                 OnPropertyChanged(nameof(LastUpdateText));
                 OnPropertyChanged(nameof(HasLastUpdate));
+                OnPropertyChanged(nameof(SelectedTotalsText));
+                OnPropertyChanged(nameof(HasSelectedTotals));
                 OnPropertyChanged(nameof(CanRescanSelected));
                 OnPropertyChanged(nameof(CanScanNow));
                 OnPropertyChanged(nameof(IsSelectedScanning));
+                OnPropertyChanged(nameof(ShowSelectedScanningHint));
+                OnPropertyChanged(nameof(SelectedScanningText));
+                OnPropertyChanged(nameof(ShowUnscannedHint));
+                OnPropertyChanged(nameof(UnscannedHintText));
+                OnPropertyChanged(nameof(CanGoUp));
             }
         }
     }
@@ -300,12 +350,49 @@ public sealed class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(IsRescanLabel));
     }
 
+    // Called when a scan entry is removed from the DB (via the Database window).
+    // Clears any in-memory ExplorerNode that was holding the old scan data and
+    // refreshes the right pane / drive overviews.
+    public void OnScanEntryDeleted(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+        var norm = path.TrimEnd('\\', '/');
+        foreach (var root in ExplorerRoots) ClearScanDataForPath(root, norm);
+        RefreshDriveScanData();
+        RefreshBarRows();
+        OnPropertyChanged(nameof(LastUpdateText));
+        OnPropertyChanged(nameof(HasLastUpdate));
+        OnPropertyChanged(nameof(SelectedTotalsText));
+        OnPropertyChanged(nameof(HasSelectedTotals));
+        OnPropertyChanged(nameof(ShowEmptyHint));
+        OnPropertyChanged(nameof(ShowEmptyFolderHint));
+        OnPropertyChanged(nameof(ShowUnscannedHint));
+        OnPropertyChanged(nameof(UnscannedHintText));
+        OnPropertyChanged(nameof(ScanButtonLabel));
+    }
+
+    private static void ClearScanDataForPath(ExplorerNode? node, string path)
+    {
+        if (node == null) return;
+        if (string.Equals(node.FullPath?.TrimEnd('\\', '/'), path, StringComparison.OrdinalIgnoreCase))
+        {
+            if (node.HasScanData) node.ClearScanData();
+        }
+        // Walk a snapshot of children to avoid issues if ClearScanData rewrites the list.
+        foreach (var c in node.Children.ToList())
+        {
+            ClearScanDataForPath(c, path);
+        }
+    }
+
     public MainViewModel()
     {
         _showFiles = _settings.ShowFiles;
         _currentMetric = _settings.CurrentMetric;
 
         PopulateDrives();
+        RefreshDriveScanData();
+        ScanCompleted += RefreshDriveScanData;
 
         _tickTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(100) };
         _tickTimer.Tick += (_, _) => UpdateElapsed();
@@ -318,18 +405,29 @@ public sealed class MainViewModel : ObservableObject
         };
     }
 
+    private void RefreshDriveScanData()
+    {
+        try
+        {
+            var byPath = _db.GetAllSummaries().ToDictionary(
+                s => s.Path.TrimEnd('\\', '/').ToLowerInvariant(),
+                s => s);
+            foreach (var d in DriveOverviews)
+            {
+                var key = d.Path.TrimEnd('\\', '/').ToLowerInvariant();
+                if (byPath.TryGetValue(key, out var s))
+                    d.SetScanData(s.Size, s.SizeOnDisk, s.FileCount, s.ScannedAt);
+                else
+                    d.ClearScanData();
+            }
+        }
+        catch (Exception ex) { Log.Warn($"RefreshDriveScanData failed: {ex.Message}"); }
+    }
+
     private void PopulateDrives()
     {
         try
         {
-            var oneDrive = Environment.GetEnvironmentVariable("OneDrive")
-                        ?? Environment.GetEnvironmentVariable("OneDriveConsumer")
-                        ?? Environment.GetEnvironmentVariable("OneDriveCommercial");
-            if (!string.IsNullOrWhiteSpace(oneDrive) && Directory.Exists(oneDrive))
-            {
-                ExplorerRoots.Add(new ExplorerNode("OneDrive", oneDrive, NodeKind.Folder, this));
-            }
-
             foreach (var drive in DriveInfo.GetDrives())
             {
                 if (!drive.IsReady) continue;
@@ -340,6 +438,7 @@ public sealed class MainViewModel : ObservableObject
                     ? drive.Name.TrimEnd('\\')
                     : $"{drive.VolumeLabel} ({drive.Name.TrimEnd('\\')})";
                 ExplorerRoots.Add(new ExplorerNode(label, drive.RootDirectory.FullName, NodeKind.Drive, this));
+                DriveOverviews.Add(DriveOverview.FromDriveInfo(drive));
             }
         }
         catch (Exception ex)
@@ -406,7 +505,6 @@ public sealed class MainViewModel : ObservableObject
 
         if (!forceRescan && node.HasScanData)
         {
-            node.IsExpanded = true;
             node.IsSelected = true;
             return;
         }
@@ -414,7 +512,6 @@ public sealed class MainViewModel : ObservableObject
         if (!forceRescan && inDb)
         {
             await TryLoadFromDbAsync(node);
-            node.IsExpanded = true;
             node.IsSelected = true;
             return;
         }
@@ -431,7 +528,6 @@ public sealed class MainViewModel : ObservableObject
                 var target = ResolveOrCreatePath(path);
                 if (target != null && target.HasScanData)
                 {
-                    target.IsExpanded = true;
                     target.IsSelected = true;
                     Log.Info($"Using ancestor scan data for {path} (ancestor={ancestor})");
                     return;
@@ -443,7 +539,6 @@ public sealed class MainViewModel : ObservableObject
         if (!autoScan)
         {
             // Navigate without scanning
-            node.IsExpanded = true;
             node.IsSelected = true;
             return;
         }
@@ -459,6 +554,10 @@ public sealed class MainViewModel : ObservableObject
     {
         if (!node.IsFolder || node.IsReparse) return Task.CompletedTask;
         if (string.IsNullOrWhiteSpace(node.FullPath)) return Task.CompletedTask;
+
+        // Make sure the user sees the in-progress scan in the right pane: select the
+        // node now (so the "Scanning..." hint shows) and let the job run.
+        if (!ReferenceEquals(_selectedNode, node)) node.IsSelected = true;
 
         var job = new ScanJob(node, forceRescan);
         ScheduleJob(job);
@@ -552,6 +651,8 @@ public sealed class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(IsBusy));
         OnPropertyChanged(nameof(ShowEmptyHint));
         OnPropertyChanged(nameof(IsSelectedScanning));
+        OnPropertyChanged(nameof(ShowSelectedScanningHint));
+        OnPropertyChanged(nameof(ShowUnscannedHint));
         OnPropertyChanged(nameof(ShowActiveScansPanel));
         job.RunTask = RunJobAsync(job);
     }
@@ -579,7 +680,6 @@ public sealed class MainViewModel : ObservableObject
             job.Node.AttachScanData(root, DateTime.Now);
             if (ReferenceEquals(_selectedNode, job.Node) || _selectedNode == null)
             {
-                job.Node.IsExpanded = true;
                 job.Node.IsSelected = true;
             }
             job.Stopwatch.Stop();
@@ -617,8 +717,12 @@ public sealed class MainViewModel : ObservableObject
             OnPropertyChanged(nameof(ShowEmptyHint));
             OnPropertyChanged(nameof(ShowActiveScansPanel));
             OnPropertyChanged(nameof(IsSelectedScanning));
+            OnPropertyChanged(nameof(ShowSelectedScanningHint));
+            OnPropertyChanged(nameof(ShowUnscannedHint));
             OnPropertyChanged(nameof(LastUpdateText));
             OnPropertyChanged(nameof(HasLastUpdate));
+            OnPropertyChanged(nameof(SelectedTotalsText));
+            OnPropertyChanged(nameof(HasSelectedTotals));
             OnPropertyChanged(nameof(CanRescanSelected));
 
             // Drain queue for this drive
@@ -634,9 +738,9 @@ public sealed class MainViewModel : ObservableObject
 
     public void OnExplorerNodeSelected(ExplorerNode node)
     {
-        if (_selectedNode != null && _selectedNode != node && !_navigating)
+        if (_selectedNode != node && !_navigating)
         {
-            _backStack.Push(_selectedNode);
+            _backStack.Push(_selectedNode); // null-pushed = "home" sentinel for back nav
             _forwardStack.Clear();
             OnPropertyChanged(nameof(CanGoBack));
             OnPropertyChanged(nameof(CanGoForward));
@@ -679,7 +783,6 @@ public sealed class MainViewModel : ObservableObject
                 var target = ResolveOrCreatePath(targetPath);
                 if (target != null && target.HasScanData)
                 {
-                    target.IsExpanded = true;
                     target.IsSelected = true;
                     Log.Info($"Selected subtree from ancestor: {targetPath} via {ancestorPath}");
                 }
@@ -714,15 +817,15 @@ public sealed class MainViewModel : ObservableObject
 
         bool autoExpand = AutoExpandTree;
 
-        // Prefer staying inside the current selected node's branch (e.g. OneDrive shortcut).
+        // Auto-expand reveals the clicked folder (its parent branch is opened so the
+        // folder is visible in the tree). It should NOT pre-expand the folder's own children.
         if (_selectedNode != null)
         {
-            _selectedNode.IsExpanded = true;
+            if (autoExpand) _selectedNode.IsExpanded = true;
             var childMatch = _selectedNode.Children.FirstOrDefault(c =>
                 c != null && string.Equals(c.FullPath, path, StringComparison.OrdinalIgnoreCase));
             if (childMatch != null)
             {
-                if (autoExpand) childMatch.IsExpanded = true;
                 childMatch.IsSelected = true;
                 return;
             }
@@ -730,7 +833,6 @@ public sealed class MainViewModel : ObservableObject
 
         var target = ResolveOrCreatePath(path);
         if (target == null) return;
-        if (autoExpand) target.IsExpanded = true;
         target.IsSelected = true;
     }
 
@@ -796,6 +898,8 @@ public sealed class MainViewModel : ObservableObject
 
         RefreshBarRows();
         OnPropertyChanged(nameof(LastUpdateText));
+        OnPropertyChanged(nameof(SelectedTotalsText));
+        OnPropertyChanged(nameof(HasSelectedTotals));
     }
 
     public bool CanScanNow => _selectedNode != null && _selectedNode.IsFolder && !_selectedNode.IsReparse && !string.IsNullOrWhiteSpace(_selectedNode.FullPath);
@@ -804,7 +908,7 @@ public sealed class MainViewModel : ObservableObject
     {
         if (_backStack.Count == 0) return;
         var target = _backStack.Pop();
-        if (_selectedNode != null) _forwardStack.Push(_selectedNode);
+        _forwardStack.Push(_selectedNode);
         NavigateTo(target);
         OnPropertyChanged(nameof(CanGoBack));
         OnPropertyChanged(nameof(CanGoForward));
@@ -814,7 +918,7 @@ public sealed class MainViewModel : ObservableObject
     {
         if (_forwardStack.Count == 0) return;
         var target = _forwardStack.Pop();
-        if (_selectedNode != null) _backStack.Push(_selectedNode);
+        _backStack.Push(_selectedNode);
         NavigateTo(target);
         OnPropertyChanged(nameof(CanGoBack));
         OnPropertyChanged(nameof(CanGoForward));
@@ -822,12 +926,47 @@ public sealed class MainViewModel : ObservableObject
 
     public void GoUp()
     {
-        var parent = GetParentPath(_selectedNode);
-        if (string.IsNullOrWhiteSpace(parent)) return;
+        var current = _selectedNode;
+        if (current == null) return;
+        var parent = GetParentPath(current);
+        if (string.IsNullOrWhiteSpace(parent))
+        {
+            // At a drive root (or root-kind shortcut) — go to the home screen.
+            GoHome();
+            return;
+        }
         var target = ResolveOrCreatePath(parent);
         if (target == null) return;
-        target.IsExpanded = true;
         target.IsSelected = true;
+    }
+
+    public void GoHome()
+    {
+        // Push current to back stack so the user can navigate forward, then clear selection.
+        if (_selectedNode != null && !_navigating)
+        {
+            _backStack.Push(_selectedNode);
+            _forwardStack.Clear();
+            OnPropertyChanged(nameof(CanGoBack));
+            OnPropertyChanged(nameof(CanGoForward));
+        }
+        // Visually deselect: walk all roots and clear IsSelected, then null out SelectedNode.
+        foreach (var root in ExplorerRoots)
+        {
+            ClearSelectionRecursive(root);
+        }
+        SelectedNode = null;
+        PathInput = "";
+    }
+
+    private static void ClearSelectionRecursive(ExplorerNode? node)
+    {
+        if (node == null) return;
+        if (node.IsSelected) node.IsSelected = false;
+        foreach (var c in node.Children)
+        {
+            ClearSelectionRecursive(c);
+        }
     }
 
     private static void AddFilesFromDisk(string folderPath, List<FolderNode> items)
@@ -883,13 +1022,22 @@ public sealed class MainViewModel : ObservableObject
         catch { return null; }
     }
 
-    private void NavigateTo(ExplorerNode target)
+    private void NavigateTo(ExplorerNode? target)
     {
         _navigating = true;
         try
         {
-            target.IsExpanded = true;
-            target.IsSelected = true;
+            if (target == null)
+            {
+                // Home / "This PC" sentinel — clear selection without touching back/forward.
+                foreach (var root in ExplorerRoots) ClearSelectionRecursive(root);
+                SelectedNode = null;
+                PathInput = "";
+            }
+            else
+            {
+                target.IsSelected = true;
+            }
         }
         finally
         {
@@ -921,7 +1069,11 @@ public sealed class MainViewModel : ObservableObject
                     RefreshBarRows();
                     OnPropertyChanged(nameof(LastUpdateText));
                     OnPropertyChanged(nameof(HasLastUpdate));
+                    OnPropertyChanged(nameof(SelectedTotalsText));
+                    OnPropertyChanged(nameof(HasSelectedTotals));
                     OnPropertyChanged(nameof(CanRescanSelected));
+                    OnPropertyChanged(nameof(ShowUnscannedHint));
+                    OnPropertyChanged(nameof(ShowEmptyFolderHint));
                 }
                 Status = $"From cache: {path}  \u2022  {root.FileCount:N0} files  \u2022  Size {FormatBytes(root.Size)}  \u2022  On disk {FormatBytes(root.SizeOnDisk)}  \u2022  load {sw.ElapsedMilliseconds}ms";
             }
@@ -1045,6 +1197,7 @@ public sealed class MainViewModel : ObservableObject
 
     private void RefreshBarRows()
     {
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
         BarRows.Clear();
         _allBarRows = new List<BarRowViewModel>();
         _barRowsShown = 0;
@@ -1119,6 +1272,9 @@ public sealed class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(BarRowsRemaining));
         OnPropertyChanged(nameof(CanLoadMoreBarRows));
         OnPropertyChanged(nameof(LoadMoreBarRowsText));
+        swTotal.Stop();
+        if (swTotal.ElapsedMilliseconds > 50)
+            Log.Info($"RefreshBarRows: {_allBarRows.Count} items, shown={_barRowsShown}, took {swTotal.ElapsedMilliseconds}ms  (selected='{_selectedNode?.FullPath}')");
     }
 
     public static string FormatBytes(long bytes)

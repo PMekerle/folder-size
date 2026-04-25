@@ -10,7 +10,11 @@
 Built with WPF + Fluent Design (Mica backdrop, native dark/light/system theming) on top of a parallel Win32 scanner that handles drives with millions of files without breaking a sweat.
 </p>
 
-![Folder Size](screenshot.png)
+![Folder Size — drive view](screenshot.png)
+
+A *This PC* home screen with one tile per drive: live capacity bar, free / total space, last-scan summary if cached, or a one-click *Scan now* if not.
+
+![Folder Size — This PC](screenshot-home.png)
 
 ## Why
 

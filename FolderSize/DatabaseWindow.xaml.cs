@@ -56,6 +56,7 @@ public partial class DatabaseWindow
         if (sender is Button b && b.Tag is string path)
         {
             _db.Delete(path);
+            _vm?.OnScanEntryDeleted(path);
             Refresh();
             EntriesChanged?.Invoke();
         }

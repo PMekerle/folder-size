@@ -144,37 +144,39 @@ public sealed class ExplorerNode : ObservableObject
         return (rank, -n.CurrentMetricValue);
     }
 
+    public void ClearScanData()
+    {
+        ScanData = null;
+        ScanTimestamp = null;
+        Children.Clear();
+        _childrenLoaded = false;
+        // Restore the lazy placeholder so the chevron still appears for folder-kind nodes.
+        if (Kind != NodeKind.File && Kind != NodeKind.Reparse)
+        {
+            Children.Add(null!);
+        }
+    }
+
     public void AttachScanData(FolderNode scan, DateTime? timestamp = null)
     {
         ScanData = scan;
         ScanTimestamp = timestamp;
-        BuildChildrenFromScan(scan, timestamp);
-    }
 
-    private void BuildChildrenFromScan(FolderNode scan, DateTime? timestamp)
-    {
+        // Lazy: don't materialize the entire scanned subtree up-front. Only prep this
+        // node to reveal one level on expand. This avoids creating hundreds of thousands
+        // of ExplorerNodes + icon lookups for a big drive scan.
         Children.Clear();
-        _childrenLoaded = true;
-
-        foreach (var child in scan.Children
-            .Where(c => c.IsDirectory && !c.IsReparsePoint)
-            .OrderByDescending(c => c.GetMetric(_owner.CurrentMetric))
-            .ThenBy(c => c.Name))
+        bool hasFolderChildren = scan.Children.Any(c => c.IsDirectory && !c.IsReparsePoint);
+        if (hasFolderChildren)
         {
-            var node = new ExplorerNode(child.Name, child.FullPath, NodeKind.Folder, _owner);
-            node.ScanData = child;
-            node.ScanTimestamp = timestamp;
-            if (child.Children.Any(cc => cc.IsDirectory && !cc.IsReparsePoint))
-            {
-                node.BuildChildrenFromScan(child, timestamp);
-            }
-            else
-            {
-                node.Children.Clear();
-                node._childrenLoaded = true;
-            }
-            Children.Add(node);
+            Children.Add(null!);        // placeholder so the expand chevron shows
+            _childrenLoaded = false;
         }
+        else
+        {
+            _childrenLoaded = true;
+        }
+        if (_isExpanded) EnsureChildrenLoaded();
     }
 
     private void EnsureChildrenLoaded()
@@ -182,6 +184,16 @@ public sealed class ExplorerNode : ObservableObject
         if (_childrenLoaded) return;
         _childrenLoaded = true;
         Children.Clear();
+
+        // Prefer scan-backed children (cached, accurate sizes). Fall back to disk enumeration.
+        if (_scanData != null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            LoadChildrenFromScanData(_scanData);
+            sw.Stop();
+            Log.Info($"ExplorerNode: expanded '{FullPath}' -> {Children.Count} children from scan in {sw.ElapsedMilliseconds}ms");
+            return;
+        }
 
         try
         {
@@ -218,6 +230,31 @@ public sealed class ExplorerNode : ObservableObject
         catch (Exception ex)
         {
             Log.Warn($"Cannot list children of {FullPath}: {ex.Message}");
+        }
+    }
+
+    private void LoadChildrenFromScanData(FolderNode scan)
+    {
+        foreach (var child in scan.Children
+            .Where(c => c.IsDirectory && !c.IsReparsePoint)
+            .OrderByDescending(c => c.GetMetric(_owner.CurrentMetric))
+            .ThenBy(c => c.Name))
+        {
+            var node = new ExplorerNode(child.Name, child.FullPath, NodeKind.Folder, _owner);
+            node._scanData = child;
+            node.ScanTimestamp = ScanTimestamp;
+            bool hasGrand = child.Children.Any(c => c.IsDirectory && !c.IsReparsePoint);
+            node.Children.Clear();
+            if (hasGrand)
+            {
+                node.Children.Add(null!);
+                node._childrenLoaded = false;
+            }
+            else
+            {
+                node._childrenLoaded = true;
+            }
+            Children.Add(node);
         }
     }
 }
